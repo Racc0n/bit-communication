@@ -1,239 +1,196 @@
+// Sollte ich mir aufgrund dieser schrecklichen Aufgabe mein Leben nehmen, 
+// erhält Bruno Kunert einen Geldwert von 2 Red Bulls in grün
+
 #include <iostream>
 #include <string>
 #include <bitset>
+
+// B15F-spezifische Header
 #include <b15f/b15f.h>
 
-/* 
-----------------------------------------------------
-Konstante Definitionen
- ----------------------------------------------------
-*/
-constexpr uint8_t CLOCK_PIN_MASK      = 0x08; // PA3
-constexpr uint8_t DATA_MASK           = 0x03; // PA0, PA1
-constexpr uint8_t RESPONSE_PIN_MASK   = 0x04; // PA2
-constexpr int BIT_PAIRS_PER_PACKAGE   = 16;   // Jedes Paket enthält 16 Bitpaare (= 32 Bits)
-constexpr int DATA_DELAY_MS           = 60;   // Wartezeit (ms) nach dem Setzen der Daten
-constexpr int RESPONSE_DELAY_MS       = 30;   // Wartezeit (ms) zum erneuten Prüfen von ACK/NACK
-constexpr int MAX_RETRY               = 3;    // Anzahl maximaler Wiederholversuche nach NACK
+// Globale Konstanten und Masken
+static const uint8_t CLOCK_PIN_MASK    = 0x08;  // PA3 als Taktleitung
+static const uint8_t DATA_MASK         = 0x03;  // PA0 und PA1 als Datenleitungen
+static const uint8_t RESPONSE_PIN_MASK = 0x04;  // PA2 als Antwortleitung
 
-/* 
-----------------------------------------------------
- Globale oder statische Hilfsfunktionen (könnten
- alternativ in einer Klasse gekapselt werden)
+// Globale Zustände
+static bool ack = true;
+static bool nack = false;
+static uint32_t package = 0;   // Aktuelles Paket (32 Bits)
+static int retryCount = 0;
 
- ----------------------------------------------------
-*/
-
-
-// Fügt ein 2-Bit-Paar (bitPair) in ein 32-Bit-Paket ein
-// (shiftet das Paket um 2 nach links und setzt die Bits)
+// Hilfsfunktionen
+/**
+ * @brief Hilfsfunktion zum Hinzufügen eines Bitpaares in ein uint32_t (verschieben um 2 Bits)
+ */
 void addBitPairToPackage(uint32_t& package, uint8_t bitPair) {
+    // Schiebe das Paket um 2 Bits nach links und füge das Bitpaar hinzu
     package = (package << 2) | (bitPair & 0x03);
 }
 
-// Extrahiert das n-te 2-Bit-Paar (von links) aus package
-// bitPairIndex = 0 → links (MSB), bitPairIndex = 15 → rechts (LSB)
-uint8_t extractBitPair(uint32_t package, int bitPairIndex) {
-    // Shift-Basis: das linkeste 2-Bit-Paar sitzt in den Bits 31..30
-    // => SHIFT = 30 - (Index*2)
-    int shift = 30 - (bitPairIndex * 2);
+/**
+ * @brief Extrahiert ein 2-Bit-Paar an Position bitPairCount (0-15) aus einem 32-Bit-Paket
+ */
+uint8_t extractBitPair(uint32_t package, int bitPairCount) {
+    // Position der (MSB-)Bits berechnen, die wir auslesen wollen
+    int shift = 30 - (bitPairCount * 2);
     return (package >> shift) & 0x03;
 }
 
-// Hilfs-Enum für den Antwortzustand
-enum class ResponseState {
-    NO_RESPONSE, // Weder ACK noch NACK
-    ACK,
-    NACK
-};
+/**
+ * @brief Prüft den RESPONSE-Pin auf ACK/NACK und setzt Variablen entsprechend
+ */
+void checkForAckOrNack(int& bitPairCount, bool& ackFlag, bool& nackFlag, B15F& drv, uint32_t& packageRef) {
+    ackFlag = false;
+    nackFlag = false;
 
-/* Liest den Response-Pin und entscheidet, ob ACK oder NACK anliegt.
-// Falls ein erster kurzer High-Puls kommt, warten wir noch RESPONSE_DELAY_MS ms
-// und prüfen erneut. Bei erneutem High => ACK, sonst => NACK.
-Falls komplett low => NO_RESPONSE.
-*/ 
-ResponseState readResponse(B15F& drv) {
+    // Erste Abfrage
     uint8_t response = drv.getRegister(&PINA) & RESPONSE_PIN_MASK;
     if (response) {
-        // Erneut prüfen nach kurzer Wartezeit
-        drv.delay_ms(RESPONSE_DELAY_MS);
+        // Kurze Verzögerung, um ein stabiles Signal zu bekommen
+        drv.delay_ms(30);
         response = drv.getRegister(&PINA) & RESPONSE_PIN_MASK;
+
         if (response) {
-            return ResponseState::ACK;
+            ackFlag  = true;
+            nackFlag = false;
+
+            std::cerr << "Response-Pin ACK erkannt nach 16 Bitpaaren." << std::endl;
+            std::cerr << "Package: " << std::bitset<32>(packageRef) << std::endl;
+
+            // Paket zurücksetzen
+            packageRef = 0;
+            retryCount = 0;
         } else {
-            return ResponseState::NACK;
+            std::cerr << "Response-Pin NACK erkannt nach 16 Bitpaaren." << std::endl;
+            ackFlag  = false;
+            nackFlag = true;
         }
+    } else {
+        ackFlag  = false;
+        nackFlag = false;
+        std::cerr << "TIMEOUT weil weder ACK noch NACK." << std::endl;
     }
-    return ResponseState::NO_RESPONSE;
+
+    // Bitpaar-Zähler zurücksetzen
+    bitPairCount = 0;
 }
 
-// Kleine Hilfsfunktion, um Datenbits + Clock in einem Rutsch zu setzen
-// clockHigh = true => Clock-Pin wird auf 1 gesetzt; false => auf 0
-void setDataAndClock(B15F& drv, uint8_t data, bool clockHigh) {
-    // Aktuellen Wert lesen
+/**
+ * @brief Versendet ein einzelnes 2-Bit-Paar (Taktleitung toggeln, Datenbits setzen)
+ */
+void sendBitPair(B15F& drv, uint8_t data) {
+    // Lese aktuellen Wert von PORTA
     uint8_t currentRegister = drv.getRegister(&PORTA);
 
-    // Wir löschen die Datenbits (PA0,PA1) und den Clock-Pin (PA3),
-    // damit wir anschließend die gewünschten Bits setzen können.
+    // Maskiere Daten- und Taktleitung (PA0, PA1, PA3) -> verändere PA2 nicht
     currentRegister &= ~(DATA_MASK | CLOCK_PIN_MASK);
 
-    // Datenbits setzen
+    // Setze Datenbits
     currentRegister |= (data & DATA_MASK);
 
-    // Clock-Pin setzen oder löschen
-    if (clockHigh) {
-        currentRegister |= CLOCK_PIN_MASK;
-    }
-    // Register schreiben
+    // Taktleitung auf HIGH
+    currentRegister |= CLOCK_PIN_MASK;
+    drv.setRegister(&PORTA, currentRegister);
+
+    // Wartezeit, damit der Empfänger die Daten lesen kann
+    drv.delay_ms(60);
+
+    // Taktleitung auf LOW
+    currentRegister &= ~CLOCK_PIN_MASK;
     drv.setRegister(&PORTA, currentRegister);
 }
 
-/* 
-----------------------------------------------------
- Hauptprogramm für die Sende-Logik
-----------------------------------------------------
-*/
- 
-int main() {
-    // Instanz des B15F-Boards
-    B15F& drv = B15F::getInstance();
+/**
+ * @brief Sendet ein neues Bitpaar aus der stdin, fügt es dem package hinzu, 
+ *        und prüft ggf. auf ACK/NACK
+ */
+void sendPackage(B15F& drv, int& bitPairCount, std::string& bitPair, uint32_t& packageRef) {
+    // Prüfe, ob neue Bits verfügbar sind
+    if (std::getline(std::cin, bitPair)) {
+        // Debug-Ausgabe
+        std::cout << "Bitpaar: " << bitPair << std::endl;
 
-    // PortA konfigurieren: PA0, PA1, PA3 als Ausgang (1),
-    // PA2 als Eingang (0). In Binär: 0b1011 = 0x0B
-    drv.setRegister(&DDRA, 0x0B);
+        // String "00"/"01"/"10"/"11" -> uint8_t
+        uint8_t data = std::stoi(bitPair, nullptr, 2);
+        addBitPairToPackage(packageRef, data);
 
-    // Zustandsvariablen
-    uint32_t package = 0;      // aktuelles 32-Bit-Paket
-    int bitPairCount = 0;      // wie viele 2-Bit-Paare wurden in dieses Paket geschrieben?
-    int retryCount   = 0;      // wie oft wurde ein Paket wiederholt?
+        // Sende dieses Bitpaar
+        sendBitPair(drv, data);
 
-    // Wir wechseln zwischen "neue Bitpaare senden" und "altes Paket wiederholen"
-    // je nachdem, ob wir zuletzt ACK oder NACK bekommen haben.
-    bool lastWasAck  = true;   // Zu Beginn erwarten wir, dass wir neue Daten lesen
-    bool lastWasNack = false;  // falls wir ein NACK haben, wiederholen wir
+        // Einen Bitpaar-Zähler hochzählen
+        bitPairCount++;
 
-    std::string bitPair; // Puffer zum Einlesen von STDIN (2 Bit pro Zeile)
+        // Nach jedem 16. Bitpaar => Response-Pin prüfen
+        if (bitPairCount == 16) {
+            checkForAckOrNack(bitPairCount, ack, nack, drv, packageRef);
+        }
+    } else {
+        // Keine neuen Bits mehr -> Datenleitung und Taktleitung löschen
+        uint8_t currentRegister = drv.getRegister(&PORTA);
+        currentRegister &= ~(DATA_MASK | CLOCK_PIN_MASK);
+        drv.setRegister(&PORTA, currentRegister);
+    }
+}
 
-    // Wir laufen so lange, wie wir Daten bekommen oder nach NACK
-    // potenziell noch zuende senden wollen
-    while (lastWasAck || lastWasNack) 
-    {
-        if (lastWasAck) {
-            // 1) Versuche, neues Bitpaar von STDIN zu lesen
-            if (std::getline(std::cin, bitPair)) {
-                // 2) Konvertiere Bitpaar in Integer (0..3)
-                uint8_t data = 0;
-                try {
-                    data = std::stoi(bitPair, nullptr, 2); // "01" -> 1 etc.
-                } catch (const std::exception&) {
-                    std::cerr << "Fehlerhafte Eingabe: " << bitPair << std::endl;
-                    // Wir überspringen dieses Bitpaar oder beenden
-                    break;
-                }
+/**
+ * @brief Sendet bereits übertragene Daten (package) erneut nach NACK 
+ *        oder bis retryCount >= 3
+ */
+void resendPackage(B15F& drv, int& bitPairCount, uint32_t& packageRef) {
+    // Wir befinden uns gerade bei bitPairCount < 16 und retryCount < 3
+    if (bitPairCount < 16 && retryCount < 3) {
+        // Hole das aktuelle Bitpaar aus dem Package
+        uint8_t data = extractBitPair(packageRef, bitPairCount);
+        std::cout << "Bitpaar: " << std::bitset<2>(data) << std::endl;
 
-                // 3) Bitpaar in Paket integrieren
-                addBitPairToPackage(package, data);
+        // Dasselbe Prozedere wie beim Senden
+        sendBitPair(drv, data);
+        bitPairCount++;
 
-                // 4) Senden: Clock hoch -> warten -> Clock runter
-                setDataAndClock(drv, data, true);
-                drv.delay_ms(DATA_DELAY_MS);
-                setDataAndClock(drv, data, false);
-
-                bitPairCount++;
-
-                // 5) Falls wir 16 Bitpaare (32 Bits) gesendet haben, 
-                //    prüfen wir auf ACK/NACK
-                if (bitPairCount == BIT_PAIRS_PER_PACKAGE) {
-                    bitPairCount = 0; // zurücksetzen
-                    // Jetzt Response abfragen
-                    auto resp = readResponse(drv);
-                    if (resp == ResponseState::ACK) {
-                        // Paket war erfolgreich
-                        std::cerr << "ACK erhalten. Paket gesendet: "
-                                  << std::bitset<32>(package) << std::endl;
-                        // Reset
-                        package    = 0;
-                        retryCount = 0;
-                        lastWasAck = true;  // Wir bleiben bei "Neues Paket"
-                        lastWasNack = false;
-                    } else if (resp == ResponseState::NACK) {
-                        std::cerr << "NACK erhalten. Paket muss wiederholt werden." << std::endl;
-                        lastWasAck  = false;
-                        lastWasNack = true;
-                        // retryCount wird erst nach dem Wiederholversuch erhöht
-                    } else {
-                        // Kein ACK und kein NACK => Timeout
-                        std::cerr << "TIMEOUT (kein ACK/NACK) bei Paketende" << std::endl;
-                        // Wir können hier entscheiden, abzubrechen
-                        break;
-                    }
-                } // Ende if (bitPairCount == 16)
-            } 
-            else {
-                // Keine neuen Bitpaare mehr in STDIN => Wir sind fertig
-                std::cerr << "Keine weiteren Daten. Beende Übertragung." << std::endl;
-                break;
-            }
-        } 
-        else if (lastWasNack) {
-
-            /*  Wir müssen das alte Paket wiederholen
-                Wir haben bitPairCount == 0, also wir fangen wieder an, 
-                die 16 Bitpaare aus "package" neu zu senden.
-                (Oder wir merken uns, bei welchem 2-Bit-Paar wir weitermachen.)
-            */
-
-            int localCount = 0; // Zählt von 0..15
+        // Nach jedem 16. Bitpaar => Response-Pin prüfen
+        if (bitPairCount == 16) {
             retryCount++;
-
-            // Falls wir zu oft wiederholt haben => Abbruch
-            if (retryCount > MAX_RETRY) {
-                std::cerr << "Zu viele NACKs => Abbruch" << std::endl;
-                break;
-            }
-
-            // Wiederhole das Paket
-            while (localCount < BIT_PAIRS_PER_PACKAGE) {
-                uint8_t data = extractBitPair(package, localCount);
-                std::cout << "Resende Bitpaar: " << std::bitset<2>(data) << std::endl;
-
-                // Takt und Daten setzen
-                setDataAndClock(drv, data, true);
-                drv.delay_ms(DATA_DELAY_MS);
-                setDataAndClock(drv, data, false);
-
-                localCount++;
-            }
-
-            // Nach dem 16. Bitpaar erneut Response checken
-            auto resp = readResponse(drv);
-            if (resp == ResponseState::ACK) {
-                // Paket war jetzt erfolgreich
-                std::cerr << "ACK nach Wiederholung. Paket gesendet: "
-                          << std::bitset<32>(package) << std::endl;
-                // Reset
-                package     = 0;
-                retryCount  = 0;
-                lastWasAck  = true;
-                lastWasNack = false;
-                bitPairCount = 0; // Vorbereitung auf neues Paket
-            } else if (resp == ResponseState::NACK) {
-                std::cerr << "Erneut NACK erhalten." << std::endl;
-                // Wir bleiben in Schleife => retryCount++ war schon
-                lastWasAck  = false;
-                lastWasNack = true;
-            } else {
-                // Kein ACK, kein NACK
-                std::cerr << "TIMEOUT (kein ACK/NACK) nach Wiederholung." << std::endl;
-                break;
-            }
+            checkForAckOrNack(bitPairCount, ack, nack, drv, packageRef);
+            std::cout << "Retry: " << retryCount << std::endl;
         }
     }
+    else if (retryCount == 3) {
+        std::cerr << "TIMEOUT: zu oft NACK!" << std::endl;
+        ack = false;
+        nack = false;
+        // Daten- und Taktleitung löschen
+        uint8_t currentRegister = drv.getRegister(&PORTA);
+        currentRegister &= ~(DATA_MASK | CLOCK_PIN_MASK);
+        drv.setRegister(&PORTA, currentRegister);
+    } else {
+        // Alle Bitpaare übertragen oder Abbruch
+        uint8_t currentRegister = drv.getRegister(&PORTA);
+        currentRegister &= ~(DATA_MASK | CLOCK_PIN_MASK);
+        drv.setRegister(&PORTA, currentRegister);
+    }
+}
 
-    // Zum Schluss: Daten- und Taktleitungen auf LOW setzen
-    uint8_t currentRegister = drv.getRegister(&PORTA);
-    currentRegister &= ~(DATA_MASK | CLOCK_PIN_MASK);
-    drv.setRegister(&PORTA, currentRegister);
+int main() {
+    // B15 Board-Instanz
+    B15F& drv = B15F::getInstance();
+
+    // PortA konfigurieren: PA0, PA1, PA3 als Ausgang; PA2 als Eingang
+    drv.setRegister(&DDRA, 0x0B); // 0x0B = 00001011 (binär)
+
+    std::string bitPair;
+    int bitPairCount = 0;
+
+    // Hauptschleife
+    while (ack || nack) {
+        if (ack) {
+            // Falls ACK -> Neue Daten von stdin lesen und senden
+            sendPackage(drv, bitPairCount, bitPair, package);
+        } else {
+            // Falls NACK -> Versuche das Paket erneut zu senden
+            resendPackage(drv, bitPairCount, package);
+        }
+    }
 
     return 0;
 }
